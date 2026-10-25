@@ -44,7 +44,9 @@ class Connection:
             import psycopg
             from psycopg.rows import dict_row
 
-            self.raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+            # Supabase transaction pooler can reuse a backend connection that
+            # already has psycopg-generated prepared statement names.
+            self.raw = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
         else:
             DB_PATH.parent.mkdir(parents=True, exist_ok=True)
             self.raw = sqlite3.connect(DB_PATH)
