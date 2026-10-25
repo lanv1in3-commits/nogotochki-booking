@@ -88,43 +88,45 @@ def add_column(conn: Connection, table: str, name: str, definition: str) -> None
 
 
 def drop_legacy_slot_constraint(conn: Connection) -> None:
-    """Remove the old hard uniqueness rule so cancelled slots can be reused."""
+    """Remove a legacy hard uniqueness rule so cancelled slots can be reused."""
     if not conn.postgres:
         return
     rows = conn.execute(
         """SELECT conname, pg_get_constraintdef(oid) AS definition
         FROM pg_constraint
-        WHERE conrelid='appointments'::regclass AND contype='u'"""
+        WHERE conrelid='booking_appointments'::regclass AND contype='u'"""
     ).fetchall()
     legacy_columns = ("master_id", "appointment_date", "start_time")
     for row in rows:
         definition = row["definition"].lower()
         if all(column in definition for column in legacy_columns):
             constraint = row["conname"].replace('"', '""')
-            conn.execute(f'ALTER TABLE appointments DROP CONSTRAINT "{constraint}"')
+            conn.execute(f'ALTER TABLE booking_appointments DROP CONSTRAINT "{constraint}"')
 
 
 def init_db() -> None:
     with db() as conn:
+        if conn.postgres:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext('nogotochki_schema_v3'))")
         serial = "BIGSERIAL PRIMARY KEY" if conn.postgres else "INTEGER PRIMARY KEY"
         integer = "BIGINT" if conn.postgres else "INTEGER"
         for statement in (
-            f"""CREATE TABLE IF NOT EXISTS users(id {serial},email TEXT NOT NULL UNIQUE,full_name TEXT NOT NULL,phone TEXT,password_salt TEXT,password_hash TEXT,role TEXT NOT NULL DEFAULT 'client' CHECK(role IN ('client','admin')),provider TEXT,provider_user_id TEXT,UNIQUE(provider,provider_user_id))""",
-            f"""CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id {integer} NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""",
-            "CREATE TABLE IF NOT EXISTS oauth_states(state_hash TEXT PRIMARY KEY,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            f"""CREATE TABLE IF NOT EXISTS booking_users(id {serial},email TEXT NOT NULL UNIQUE,full_name TEXT NOT NULL,phone TEXT,password_salt TEXT,password_hash TEXT,role TEXT NOT NULL DEFAULT 'client' CHECK(role IN ('client','admin')),provider TEXT,provider_user_id TEXT,UNIQUE(provider,provider_user_id))""",
+            f"""CREATE TABLE IF NOT EXISTS booking_sessions(token_hash TEXT PRIMARY KEY,user_id {integer} NOT NULL REFERENCES booking_users(id) ON DELETE CASCADE,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""",
+            "CREATE TABLE IF NOT EXISTS booking_oauth_states(state_hash TEXT PRIMARY KEY,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS booking_services(code TEXT PRIMARY KEY,name TEXT NOT NULL,duration_minutes INTEGER NOT NULL,price INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1)",
             f"CREATE TABLE IF NOT EXISTS booking_masters(id {serial},name TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1)",
             f"CREATE TABLE IF NOT EXISTS booking_schedules(id {serial},master_id {integer} NOT NULL REFERENCES booking_masters(id),weekday INTEGER NOT NULL,work_start TEXT NOT NULL,work_end TEXT NOT NULL,UNIQUE(master_id,weekday))",
             f"CREATE TABLE IF NOT EXISTS booking_blocks(id {serial},master_id {integer} NOT NULL REFERENCES booking_masters(id),block_date TEXT NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '')",
-            f"""CREATE TABLE IF NOT EXISTS appointments(id {serial},user_id {integer} NOT NULL REFERENCES users(id),service_code TEXT NOT NULL,master_id {integer} NOT NULL,appointment_date TEXT NOT NULL,start_time TEXT NOT NULL,duration_minutes INTEGER,service_name TEXT,master_name TEXT,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""",
+            f"""CREATE TABLE IF NOT EXISTS booking_appointments(id {serial},user_id {integer} NOT NULL REFERENCES booking_users(id),service_code TEXT NOT NULL,master_id {integer} NOT NULL,appointment_date TEXT NOT NULL,start_time TEXT NOT NULL,duration_minutes INTEGER,service_name TEXT,master_name TEXT,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""",
         ):
             conn.execute(statement)
 
         # Migrate the earlier publication-homework database without deleting data.
-        add_column(conn, "appointments", "duration_minutes", "INTEGER")
-        add_column(conn, "appointments", "service_name", "TEXT")
-        add_column(conn, "appointments", "master_name", "TEXT")
-        add_column(conn, "appointments", "updated_at", "TEXT")
+        add_column(conn, "booking_appointments", "duration_minutes", "INTEGER")
+        add_column(conn, "booking_appointments", "service_name", "TEXT")
+        add_column(conn, "booking_appointments", "master_name", "TEXT")
+        add_column(conn, "booking_appointments", "updated_at", "TEXT")
         drop_legacy_slot_constraint(conn)
         for code, name, duration, price in DEFAULT_SERVICES:
             if not conn.execute("SELECT code FROM booking_services WHERE code=?", (code,)).fetchone():
@@ -135,18 +137,20 @@ def init_db() -> None:
             for weekday in range(6):
                 if not conn.execute("SELECT id FROM booking_schedules WHERE master_id=? AND weekday=?", (master_id, weekday)).fetchone():
                     conn.execute("INSERT INTO booking_schedules(master_id,weekday,work_start,work_end) VALUES(?,?,?,?)", (master_id, weekday, "10:00", "19:00"))
-        conn.execute("UPDATE appointments SET duration_minutes=COALESCE(duration_minutes,(SELECT duration_minutes FROM booking_services WHERE booking_services.code=appointments.service_code),60)")
-        conn.execute("UPDATE appointments SET service_name=COALESCE(service_name,(SELECT name FROM booking_services WHERE booking_services.code=appointments.service_code),service_code)")
-        conn.execute("UPDATE appointments SET master_name=COALESCE(master_name,(SELECT name FROM booking_masters WHERE booking_masters.id=appointments.master_id),'Мастер')")
-        conn.execute("UPDATE appointments SET updated_at=COALESCE(updated_at,created_at,CURRENT_TIMESTAMP)")
+        if conn.postgres:
+            conn.execute("SELECT setval(pg_get_serial_sequence('booking_masters','id'),COALESCE((SELECT MAX(id) FROM booking_masters),1),true)")
+        conn.execute("UPDATE booking_appointments SET duration_minutes=COALESCE(duration_minutes,(SELECT duration_minutes FROM booking_services WHERE booking_services.code=booking_appointments.service_code),60)")
+        conn.execute("UPDATE booking_appointments SET service_name=COALESCE(service_name,(SELECT name FROM booking_services WHERE booking_services.code=booking_appointments.service_code),service_code)")
+        conn.execute("UPDATE booking_appointments SET master_name=COALESCE(master_name,(SELECT name FROM booking_masters WHERE booking_masters.id=booking_appointments.master_id),'Мастер')")
+        conn.execute("UPDATE booking_appointments SET updated_at=COALESCE(updated_at,created_at,CURRENT_TIMESTAMP)")
         admin_email, admin_password = os.getenv("ADMIN_EMAIL", "").strip().lower(), os.getenv("ADMIN_PASSWORD", "")
         if admin_email and admin_password:
-            row = conn.execute("SELECT id FROM users WHERE email=?", (admin_email,)).fetchone()
+            row = conn.execute("SELECT id FROM booking_users WHERE email=?", (admin_email,)).fetchone()
             if row:
-                conn.execute("UPDATE users SET role='admin' WHERE id=?", (row["id"],))
+                conn.execute("UPDATE booking_users SET role='admin' WHERE id=?", (row["id"],))
             else:
                 salt, digest = password_hash(admin_password)
-                conn.execute("INSERT INTO users(email,full_name,password_salt,password_hash,role) VALUES(?,?,?,?, 'admin')", (admin_email, "Администратор", salt, digest))
+                conn.execute("INSERT INTO booking_users(email,full_name,password_salt,password_hash,role) VALUES(?,?,?,?, 'admin')", (admin_email, "Администратор", salt, digest))
 
 
 def esc(value: object) -> str:
@@ -192,13 +196,13 @@ def current_user(environ):
     if not token:
         return None
     with db() as conn:
-        return conn.execute("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?", (hashlib.sha256(token.value.encode()).hexdigest(),)).fetchone()
+        return conn.execute("SELECT u.* FROM booking_sessions s JOIN booking_users u ON u.id=s.user_id WHERE s.token_hash=?", (hashlib.sha256(token.value.encode()).hexdigest(),)).fetchone()
 
 
 def issue_session(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     with db() as conn:
-        conn.execute("INSERT INTO sessions(token_hash,user_id) VALUES(?,?)", (hashlib.sha256(token.encode()).hexdigest(), user_id))
+        conn.execute("INSERT INTO booking_sessions(token_hash,user_id) VALUES(?,?)", (hashlib.sha256(token.encode()).hexdigest(), user_id))
     return f"session={token}; Path=/; HttpOnly; SameSite=Lax{'; Secure' if BASE_URL.startswith('https://') else ''}"
 
 
@@ -231,7 +235,7 @@ def available_slots(conn: Connection, service_code: str, master_id: int, day: st
     if not schedule:
         return []
     duration = int(service["duration_minutes"])
-    appointments = conn.execute("SELECT id,start_time,duration_minutes FROM appointments WHERE master_id=? AND appointment_date=? AND status='active'", (master_id, day)).fetchall()
+    appointments = conn.execute("SELECT id,start_time,duration_minutes FROM booking_appointments WHERE master_id=? AND appointment_date=? AND status='active'", (master_id, day)).fetchall()
     blocks = conn.execute("SELECT start_time,end_time FROM booking_blocks WHERE master_id=? AND block_date=?", (master_id, day)).fetchall()
     cursor, work_end, slots = parse_clock(schedule["work_start"]), parse_clock(schedule["work_end"]), []
     while cursor + timedelta(minutes=duration) <= work_end:
@@ -323,7 +327,7 @@ def application(environ, start_response: Callable):
                     salt, digest = password_hash(password)
                     try:
                         with db() as conn:
-                            user_id = insert_id(conn, "INSERT INTO users(email,full_name,phone,password_salt,password_hash) VALUES(?,?,?,?,?)", (email, data["full_name"].strip(), data.get("phone", ""), salt, digest))
+                            user_id = insert_id(conn, "INSERT INTO booking_users(email,full_name,phone,password_salt,password_hash) VALUES(?,?,?,?,?)", (email, data["full_name"].strip(), data.get("phone", ""), salt, digest))
                         result = redirect("/book", issue_session(user_id))
                     except Exception as exc:
                         if "unique" not in str(exc).lower(): raise
@@ -332,7 +336,7 @@ def application(environ, start_response: Callable):
             if method == "GET": result = render_auth("login")
             else:
                 data = form_data(environ)
-                with db() as conn: found = conn.execute("SELECT * FROM users WHERE email=?", (data.get("email", "").strip().lower(),)).fetchone()
+                with db() as conn: found = conn.execute("SELECT * FROM booking_users WHERE email=?", (data.get("email", "").strip().lower(),)).fetchone()
                 ok = bool(found and found["password_hash"] and hmac.compare_digest(password_hash(data.get("password", ""), found["password_salt"])[1], found["password_hash"]))
                 result = redirect("/admin" if ok and found["role"] == "admin" else "/cabinet", issue_session(found["id"])) if ok else render_auth("login", "Неверный email или пароль")
         elif path == "/logout":
@@ -350,31 +354,31 @@ def application(environ, start_response: Callable):
                     service = conn.execute("SELECT * FROM booking_services WHERE code=? AND active=1", (code,)).fetchone()
                     master = conn.execute("SELECT * FROM booking_masters WHERE id=? AND active=1", (master_id,)).fetchone()
                     if not service or not master or start not in available_slots(conn, code, master_id, day): raise ValueError("Этот слот уже занят или недоступен. Выберите другое время.")
-                    appointment_id = insert_id(conn, "INSERT INTO appointments(user_id,service_code,master_id,appointment_date,start_time,duration_minutes,service_name,master_name,status,updated_at) VALUES(?,?,?,?,?,?,?,?,'active',CURRENT_TIMESTAMP)", (user["id"], code, master_id, day, start, service["duration_minutes"], service["name"], master["name"]))
+                    appointment_id = insert_id(conn, "INSERT INTO booking_appointments(user_id,service_code,master_id,appointment_date,start_time,duration_minutes,service_name,master_name,status,updated_at) VALUES(?,?,?,?,?,?,?,?,'active',CURRENT_TIMESTAMP)", (user["id"], code, master_id, day, start, service["duration_minutes"], service["name"], master["name"]))
                 result = redirect(f"/confirmation?id={appointment_id}")
         elif path == "/confirmation":
             if not user: result = redirect("/login")
             else:
                 appointment_id = int(query_data(environ).get("id", "0"))
-                with db() as conn: row = conn.execute("SELECT * FROM appointments WHERE id=? AND user_id=?", (appointment_id, user["id"])).fetchone()
+                with db() as conn: row = conn.execute("SELECT * FROM booking_appointments WHERE id=? AND user_id=?", (appointment_id, user["id"])).fetchone()
                 result = page("Подтверждение", f'<section class="panel"><h2>Вы записаны!</h2><p>Ждём вас в студии.</p><h3>Детали вашей записи</h3><p>Услуга: {esc(row["service_name"])}<br>Мастер: {esc(row["master_name"])}<br>Когда: {esc(row["appointment_date"])}, {esc(row["start_time"])}</p><a class="button secondary" href="/cabinet">Открыть кабинет</a></section>', user) if row else page("Не найдено", '<section class="panel"><h2>Запись не найдена</h2></section>', user, "404 Not Found")
         elif path == "/appointment":
             if not user: result = redirect("/login")
             else:
                 appointment_id = int(query_data(environ).get("id", "0"))
-                with db() as conn: row = conn.execute("SELECT * FROM appointments WHERE id=? AND user_id=?", (appointment_id, user["id"])).fetchone()
+                with db() as conn: row = conn.execute("SELECT * FROM booking_appointments WHERE id=? AND user_id=?", (appointment_id, user["id"])).fetchone()
                 result = page("Запись", f'<section class="panel"><h2>Запись №{row["id"]}</h2><p>{esc(row["service_name"])} · {esc(row["master_name"])} · {esc(row["appointment_date"])}, {esc(row["start_time"])} · {esc(row["status"])}</p></section>', user) if row else page("Не найдено", '<section class="panel"><h2>Запись не найдена</h2></section>', user, "404 Not Found")
         elif path == "/cabinet":
             if not user: result = redirect("/login")
             else:
-                with db() as conn: rows = conn.execute("SELECT * FROM appointments WHERE user_id=? ORDER BY appointment_date,start_time", (user["id"],)).fetchall()
+                with db() as conn: rows = conn.execute("SELECT * FROM booking_appointments WHERE user_id=? ORDER BY appointment_date,start_time", (user["id"],)).fetchall()
                 result = page("Мои записи", f'<section class="panel"><h2>Мои записи</h2><table><tr><th>Номер</th><th>Услуга</th><th>Мастер</th><th>Дата и время</th><th>Статус</th></tr>{appointment_rows(rows)}</table></section>', user)
         elif path == "/admin":
             denied = require_admin(user)
             if denied: result = denied
             else:
                 with db() as conn:
-                    rows = conn.execute("SELECT a.*,u.full_name,u.email FROM appointments a JOIN users u ON u.id=a.user_id ORDER BY appointment_date,start_time").fetchall()
+                    rows = conn.execute("SELECT a.*,u.full_name,u.email FROM booking_appointments a JOIN booking_users u ON u.id=a.user_id ORDER BY appointment_date,start_time").fetchall()
                     blocks = conn.execute("SELECT b.*,m.name master_name FROM booking_blocks b JOIN booking_masters m ON m.id=b.master_id ORDER BY block_date,start_time").fetchall()
                     masters = conn.execute("SELECT * FROM booking_masters WHERE active=1 ORDER BY name").fetchall()
                 options = "".join(f'<option value="{row["id"]}">{esc(row["name"])}</option>' for row in masters)
@@ -387,7 +391,7 @@ def application(environ, start_response: Callable):
             elif method == "GET":
                 appointment_id = int(query_data(environ).get("id", "0"))
                 with db() as conn:
-                    row = conn.execute("SELECT * FROM appointments WHERE id=?", (appointment_id,)).fetchone(); services, masters = active_catalog(conn)
+                    row = conn.execute("SELECT * FROM booking_appointments WHERE id=?", (appointment_id,)).fetchone(); services, masters = active_catalog(conn)
                 if not row: result = page("Не найдено", '<section class="panel"><h2>Запись не найдена</h2></section>', user, "404 Not Found")
                 else:
                     service_options = "".join(f'<option value="{esc(x["code"])}" {"selected" if x["code"] == row["service_code"] else ""}>{esc(x["name"])}</option>' for x in services)
@@ -396,14 +400,14 @@ def application(environ, start_response: Callable):
             else:
                 data = form_data(environ); appointment_id = int(data.get("id", "0"))
                 if data.get("action") == "cancel":
-                    with db() as conn: conn.execute("UPDATE appointments SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?", (appointment_id,))
+                    with db() as conn: conn.execute("UPDATE booking_appointments SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=?", (appointment_id,))
                 else:
                     master_id, code, day, start = int(data.get("master_id", "0")), data.get("service_code", ""), data.get("appointment_date", ""), data.get("start_time", "")
                     with db() as conn:
                         lock_booking_day(conn, master_id, day)
-                        row = conn.execute("SELECT * FROM appointments WHERE id=?", (appointment_id,)).fetchone(); service = conn.execute("SELECT * FROM booking_services WHERE code=? AND active=1", (code,)).fetchone(); master = conn.execute("SELECT * FROM booking_masters WHERE id=? AND active=1", (master_id,)).fetchone()
+                        row = conn.execute("SELECT * FROM booking_appointments WHERE id=?", (appointment_id,)).fetchone(); service = conn.execute("SELECT * FROM booking_services WHERE code=? AND active=1", (code,)).fetchone(); master = conn.execute("SELECT * FROM booking_masters WHERE id=? AND active=1", (master_id,)).fetchone()
                         if not row or not service or not master or start not in available_slots(conn, code, master_id, day, appointment_id): raise ValueError("Новое время недоступно")
-                        conn.execute("UPDATE appointments SET service_code=?,master_id=?,appointment_date=?,start_time=?,duration_minutes=?,service_name=?,master_name=?,status='active',updated_at=CURRENT_TIMESTAMP WHERE id=?", (code, master_id, day, start, service["duration_minutes"], service["name"], master["name"], appointment_id))
+                        conn.execute("UPDATE booking_appointments SET service_code=?,master_id=?,appointment_date=?,start_time=?,duration_minutes=?,service_name=?,master_name=?,status='active',updated_at=CURRENT_TIMESTAMP WHERE id=?", (code, master_id, day, start, service["duration_minutes"], service["name"], master["name"], appointment_id))
                 result = redirect("/admin")
         elif path == "/admin/block" and method == "POST":
             denied = require_admin(user)
@@ -440,23 +444,23 @@ def application(environ, start_response: Callable):
             if not YANDEX_CLIENT_ID or not YANDEX_CLIENT_SECRET: result = page("Яндекс", '<section class="panel"><h2>Вход через Яндекс пока не настроен</h2></section>', user, "503 Service Unavailable")
             else:
                 state = secrets.token_urlsafe(24)
-                with db() as conn: conn.execute("INSERT INTO oauth_states(state_hash) VALUES(?)", (hashlib.sha256(state.encode()).hexdigest(),))
+                with db() as conn: conn.execute("INSERT INTO booking_oauth_states(state_hash) VALUES(?)", (hashlib.sha256(state.encode()).hexdigest(),))
                 result = redirect("https://oauth.yandex.ru/authorize?" + urlencode({"response_type": "code", "client_id": YANDEX_CLIENT_ID, "redirect_uri": f"{BASE_URL}/auth/yandex/callback", "state": state}))
         elif path == "/auth/yandex/callback":
             params = query_data(environ); state_hash = hashlib.sha256(params.get("state", "").encode()).hexdigest()
             with db() as conn:
-                state_row = conn.execute("SELECT state_hash FROM oauth_states WHERE state_hash=?", (state_hash,)).fetchone()
-                if state_row: conn.execute("DELETE FROM oauth_states WHERE state_hash=?", (state_hash,))
+                state_row = conn.execute("SELECT state_hash FROM booking_oauth_states WHERE state_hash=?", (state_hash,)).fetchone()
+                if state_row: conn.execute("DELETE FROM booking_oauth_states WHERE state_hash=?", (state_hash,))
             if not state_row or not params.get("code"): result = page("Ошибка входа", '<section class="panel"><h2>Не удалось проверить вход через Яндекс</h2></section>', None, "400 Bad Request")
             else:
                 info = exchange_yandex(params["code"]); provider_id = str(info["id"]); email = (info.get("default_email") or f'{info.get("login", provider_id)}@yandex.local').lower(); name = info.get("real_name") or info.get("display_name") or info.get("login") or "Пользователь Яндекса"
                 with db() as conn:
-                    found = conn.execute("SELECT * FROM users WHERE provider='yandex' AND provider_user_id=?", (provider_id,)).fetchone()
+                    found = conn.execute("SELECT * FROM booking_users WHERE provider='yandex' AND provider_user_id=?", (provider_id,)).fetchone()
                     if not found:
-                        found = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-                        if found: conn.execute("UPDATE users SET provider='yandex',provider_user_id=? WHERE id=?", (provider_id, found["id"]))
+                        found = conn.execute("SELECT * FROM booking_users WHERE email=?", (email,)).fetchone()
+                        if found: conn.execute("UPDATE booking_users SET provider='yandex',provider_user_id=? WHERE id=?", (provider_id, found["id"]))
                         else:
-                            user_id = insert_id(conn, "INSERT INTO users(email,full_name,role,provider,provider_user_id) VALUES(?,?,'client','yandex',?)", (email, name, provider_id)); found = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                            user_id = insert_id(conn, "INSERT INTO booking_users(email,full_name,role,provider,provider_user_id) VALUES(?,?,'client','yandex',?)", (email, name, provider_id)); found = conn.execute("SELECT * FROM booking_users WHERE id=?", (user_id,)).fetchone()
                 result = redirect("/cabinet", issue_session(found["id"]))
         else:
             result = page("Не найдено", '<section class="panel"><h2>Страница не найдена</h2></section>', user, "404 Not Found")
