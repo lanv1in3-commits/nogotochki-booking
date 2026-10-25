@@ -142,7 +142,8 @@ def init_db() -> None:
         conn.execute("UPDATE booking_appointments SET duration_minutes=COALESCE(duration_minutes,(SELECT duration_minutes FROM booking_services WHERE booking_services.code=booking_appointments.service_code),60)")
         conn.execute("UPDATE booking_appointments SET service_name=COALESCE(service_name,(SELECT name FROM booking_services WHERE booking_services.code=booking_appointments.service_code),service_code)")
         conn.execute("UPDATE booking_appointments SET master_name=COALESCE(master_name,(SELECT name FROM booking_masters WHERE booking_masters.id=booking_appointments.master_id),'Мастер')")
-        conn.execute("UPDATE booking_appointments SET updated_at=COALESCE(updated_at,created_at,CURRENT_TIMESTAMP)")
+        current_time_text = "CURRENT_TIMESTAMP::text" if conn.postgres else "CURRENT_TIMESTAMP"
+        conn.execute(f"UPDATE booking_appointments SET updated_at=COALESCE(updated_at,created_at,{current_time_text})")
         admin_email, admin_password = os.getenv("ADMIN_EMAIL", "").strip().lower(), os.getenv("ADMIN_PASSWORD", "")
         if admin_email and admin_password:
             row = conn.execute("SELECT id FROM booking_users WHERE email=?", (admin_email,)).fetchone()
