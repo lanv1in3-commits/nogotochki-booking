@@ -3,7 +3,12 @@
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "/app.py"
+      "destination": "/api"
     }
-  ]
+  ],
+  "functions": {
+    "api/**/*.py": {
+      "excludeFiles": "{tests/**,__pycache__/**,**/*.pyc}"
+    }
+  }
 }
