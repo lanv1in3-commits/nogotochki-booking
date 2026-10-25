@@ -5,10 +5,5 @@
       "source": "/(.*)",
       "destination": "/api"
     }
-  ],
-  "functions": {
-    "api/**/*.py": {
-      "excludeFiles": "{tests/**,__pycache__/**,**/*.pyc}"
-    }
-  }
+  ]
 }
